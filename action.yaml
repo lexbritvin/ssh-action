@@ -1,0 +1,564 @@
+name: 'SSH Command & Port Forwarding'
+description: '🛠️ SSH tunnels & remote commands. Port forwarding, deployments & execution via jump hosts. Linux/Windows/macOS'
+
+branding:
+  icon: 'link'
+  color: 'blue'
+
+inputs:
+  # === Connection Settings ===
+  host:
+    description: 'Target SSH host (required)'
+    required: true
+  port:
+    description: 'SSH port (default: 22)'
+    required: false
+    default: ''
+  username:
+    description: 'SSH username (optional - uses current user or SSH config if not specified)'
+    required: false
+
+  # === Authentication ===
+  private-key:
+    description: 'SSH private key content (recommended over password)'
+    required: false
+  private-key-path:
+    description: 'Path to SSH private key file (recommended over password)'
+    required: false
+  password:
+    description: 'SSH password (not recommended - use private key instead)'
+    required: false
+  known-hosts:
+    description: 'SSH known_hosts content for host verification'
+    required: false
+
+  # === Port Forwarding ===
+  local-forwards:
+    description: 'Local port forwards (-L). Format: "local_port:remote_host:remote_port" or "local_host:local_port:remote_host:remote_port". Multiple forwards separated by comma'
+    required: false
+  remote-forwards:
+    description: 'Remote port forwards (-R). Format: "remote_port:local_host:local_port" or "remote_host:remote_port:local_host:local_port". Multiple forwards separated by comma'
+    required: false
+
+  # === Advanced Options ===
+  jump-hosts:
+    description: 'Comma-separated list of jump hosts (format: user@host:port)'
+    required: false
+  extra-flags:
+    description: 'Additional SSH flags and options'
+    required: false
+    default: ''
+  command:
+    description: 'Command to execute on remote host (alternative to port forwarding)'
+    required: false
+    default: ''
+  post-command:
+    description: 'Command to execute after workflow completion (cleanup tasks)'
+    required: false
+    default: ''
+
+  # === Connection Tuning ===
+  timeout:
+    description: 'Connection timeout in seconds'
+    required: false
+    default: '30'
+  keep-alive:
+    description: 'Send keep-alive packets every N seconds'
+    required: false
+    default: '60'
+  dry-run:
+    description: 'Show SSH command without executing (for debugging or to have ssh string)'
+    required: false
+    default: 'false'
+
+outputs:
+  pid:
+    description: 'Process ID of the background SSH tunnel'
+    value: ${{ steps.ssh.outputs.pid }}
+  allocated-host:
+    description: 'Public host for remote forward (when using dynamic port allocation)'
+    value: ${{ steps.ssh.outputs.allocated-host }}
+  allocated-port:
+    description: 'Allocated port for remote forward (when using dynamic port allocation)'
+    value: ${{ steps.ssh.outputs.allocated-port }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ==========================================
+    # STEP 1: Input Validation & Configuration Check
+    # ==========================================
+    - name: 🔍 Validate Configuration
+      shell: bash
+      env:
+        INPUT_PRIVATE_KEY: ${{ inputs.private-key }}
+        INPUT_PRIVATE_KEY_PATH: ${{ inputs.private-key-path }}
+        INPUT_COMMAND: "${{ inputs.command }}"
+        INPUT_LOCAL_FORWARDS: ${{ inputs.local-forwards }}
+        INPUT_REMOTE_FORWARDS: ${{ inputs.remote-forwards }}
+      run: |
+        echo "🔧 Validating SSH action configuration..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Check for conflicting private key inputs
+        if [[ -n "$INPUT_PRIVATE_KEY" && -n "$INPUT_PRIVATE_KEY_PATH" ]]; then
+          echo "❌ Configuration Error: Cannot specify both 'private-key' and 'private-key-path'"
+          echo "   Please use only one authentication method."
+          exit 1
+        fi
+
+        # Determine operation mode and validate accordingly
+        if [[ -n "$INPUT_COMMAND" ]]; then
+          # Command execution mode
+          if [[ -n "$INPUT_LOCAL_FORWARDS" || -n "$INPUT_REMOTE_FORWARDS" ]]; then
+            echo "❌ Configuration Error: Cannot combine command execution with port forwarding"
+            echo "   Choose one operation mode:"
+            echo "   📋 Command Mode: Use 'command' to execute on remote host"
+            echo "   🔗 Forwarding Mode: Use 'local-forwards' and/or 'remote-forwards'"
+            exit 1
+          fi
+          echo "📋 Operation Mode: Command Execution"
+          echo "   Command: '$INPUT_COMMAND'"
+        else
+          # Port forwarding mode
+          if [[ -z "$INPUT_LOCAL_FORWARDS" && -z "$INPUT_REMOTE_FORWARDS" ]]; then
+            echo "❌ Configuration Error: No operation specified"
+            echo "   Please specify either:"
+            echo "   📋 'command' for remote command execution"
+            echo "   🔗 'local-forwards' and/or 'remote-forwards' for port forwarding"
+            exit 1
+          fi
+          echo "🔗 Operation Mode: Port Forwarding"
+        fi
+        
+        # Validate local-forwards format
+        if [[ -n "$INPUT_LOCAL_FORWARDS" ]]; then
+          echo "🔍 Validating local port forwards..."
+          IFS=',' read -ra FORWARDS <<< "$INPUT_LOCAL_FORWARDS"
+          for forward in "${FORWARDS[@]}"; do
+            forward=$(echo "$forward" | xargs) # trim whitespace
+            if [[ ! "$forward" =~ ^([^:]+:)?[0-9]+:[^:]+:[0-9]+$ ]]; then
+              echo "❌ Invalid local-forwards format: '$forward'"
+              echo "   Expected: '[local_host:]local_port:remote_host:remote_port'"
+              echo "   Example: '8080:localhost:80' or '127.0.0.1:8080:web-server:80'"
+              exit 1
+            fi
+            echo "   ✅ $forward"
+          done
+        fi
+        
+        # Validate remote-forwards format
+        if [[ -n "$INPUT_REMOTE_FORWARDS" ]]; then
+          echo "🔍 Validating remote port forwards..."
+          IFS=',' read -ra FORWARDS <<< "$INPUT_REMOTE_FORWARDS"
+          for forward in "${FORWARDS[@]}"; do
+            forward=$(echo "$forward" | xargs) # trim whitespace
+            if [[ ! "$forward" =~ ^([^:]+:)?[0-9]+:[^:]+:[0-9]+$ ]]; then
+              echo "❌ Invalid remote-forwards format: '$forward'"
+              echo "   Expected: '[remote_host:]remote_port:local_host:local_port'"
+              echo "   Example: '8080:localhost:3000' or '0:localhost:3000' (dynamic port)"
+              exit 1
+            fi
+            echo "   ✅ $forward"
+          done
+        fi
+        
+        echo "✅ Configuration validation completed successfully!"
+
+    # ==========================================
+    # STEP 2: SSH Environment Setup
+    # ==========================================
+    - name: 🔐 Setup SSH Environment
+      shell: bash
+      id: ssh-config
+      env:
+        INPUT_PRIVATE_KEY: ${{ inputs.private-key }}
+        INPUT_PRIVATE_KEY_PATH: ${{ inputs.private-key-path }}
+        INPUT_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+      run: |
+        echo "🔐 Setting up SSH environment..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Create SSH directory with proper permissions
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        echo "📁 SSH directory prepared"
+
+        # Generate unique connection ID for this session
+        CONN_ID="ssh_tunnel_$RANDOM"
+        
+        # Configure private key authentication
+        SSH_PRIVATE_KEY_PATH="$INPUT_PRIVATE_KEY_PATH"
+        if [[ -n "$INPUT_PRIVATE_KEY" ]]; then
+          SSH_PRIVATE_KEY_PATH="$HOME/.ssh/id_${CONN_ID}"
+          echo "$INPUT_PRIVATE_KEY" > "$SSH_PRIVATE_KEY_PATH"
+          chmod 600 "$SSH_PRIVATE_KEY_PATH"
+          echo "🔑 Private key configured from input content"
+        elif [[ -n "$SSH_PRIVATE_KEY_PATH" ]]; then
+          echo "🔑 Using private key from path: $SSH_PRIVATE_KEY_PATH"
+        fi
+        echo "private-key-path=$SSH_PRIVATE_KEY_PATH" >> $GITHUB_OUTPUT
+        
+        # Configure known hosts if provided
+        if [[ -n "$INPUT_KNOWN_HOSTS" ]]; then
+          KNOWN_HOSTS_FILE="$HOME/.ssh/known_hosts_${CONN_ID}"
+          echo "$INPUT_KNOWN_HOSTS" >> "$KNOWN_HOSTS_FILE"
+          chmod 600 "$KNOWN_HOSTS_FILE"
+          echo "🛡️ Known hosts configured"
+        
+          # Create SSH config file for this connection
+          SSH_CONFIG_FILE="$HOME/.ssh/config_${CONN_ID}"
+
+          # Include existing SSH config if available
+          if [[ -f "$HOME/.ssh/config" ]]; then
+            echo "Include ~/.ssh/config" > "$SSH_CONFIG_FILE"
+            echo "" >> "$SSH_CONFIG_FILE"
+            echo "📋 Existing SSH config included"
+          fi
+
+          # Add custom known_hosts (applies to jump hosts too)
+          echo "UserKnownHostsFile $KNOWN_HOSTS_FILE" >> "$SSH_CONFIG_FILE"
+          chmod 600 "$SSH_CONFIG_FILE"
+          echo "ssh-config=$SSH_CONFIG_FILE" >> $GITHUB_OUTPUT
+          echo "⚙️ SSH config file created: $SSH_CONFIG_FILE"
+        fi
+        
+        echo "✅ SSH environment setup completed!"
+
+    # ==========================================
+    # STEP 3: Install Dependencies (Linux)
+    # ==========================================
+    - name: 📦 Install sshpass (Linux)
+      if: inputs.password != '' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        echo "📦 Installing sshpass for password authentication (Linux)..."
+        sudo apt-get update -qq
+        sudo apt-get install -y sshpass
+        echo "✅ sshpass installed successfully"
+
+    # ==========================================
+    # STEP 4: Install Dependencies (macOS)
+    # ==========================================
+    - name: 📦 Install sshpass (macOS)
+      if: inputs.password != '' && runner.os == 'macOS'
+      shell: bash
+      run: |
+        echo "📦 Installing sshpass for password authentication (macOS)..."
+        brew install sshpass
+        echo "✅ sshpass installed successfully"
+
+    # ==========================================
+    # STEP 5: Build SSH Command
+    # ==========================================
+    - name: ⚙️ Prepare SSH Command
+      id: cmd
+      shell: bash
+      env:
+        SSH_CONFIG_FILE: ${{ steps.ssh-config.outputs.ssh-config }}
+        SSH_PRIVATE_KEY_PATH: ${{ steps.ssh-config.outputs.private-key-path }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_HOST: ${{ inputs.host }}
+        INPUT_PORT: ${{ inputs.port }}
+        INPUT_USER: ${{ inputs.username }}
+        INPUT_JUMP_HOSTS: ${{ inputs.jump-hosts }}
+        INPUT_PASSWORD: ${{ inputs.password }}
+        INPUT_LOCAL_FORWARDS: ${{ inputs.local-forwards }}
+        INPUT_REMOTE_FORWARDS: ${{ inputs.remote-forwards }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_KEEP_ALIVE: ${{ inputs.keep-alive }}
+        INPUT_EXTRA_FLAGS: ${{ inputs.extra-flags }}
+      run: |
+        echo "⚙️ Building SSH command..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        
+        # Start building the SSH command
+        SSH_CMD="ssh"
+        
+        # Add custom SSH config if available
+        if [[ -n "$SSH_CONFIG_FILE" ]]; then
+          SSH_CMD="$SSH_CMD -F '$SSH_CONFIG_FILE'"
+          echo "📋 Using custom SSH config"
+        fi
+        
+        # Configure connection parameters
+        SSH_CMD="$SSH_CMD -o ConnectTimeout=$INPUT_TIMEOUT"
+        SSH_CMD="$SSH_CMD -o ServerAliveInterval=$INPUT_KEEP_ALIVE"
+        SSH_CMD="$SSH_CMD -o ServerAliveCountMax=3"
+        SSH_CMD="$SSH_CMD -T"  # Disable pseudo-terminal allocation
+        echo "⏱️ Connection timeout: ${INPUT_TIMEOUT}s, Keep-alive: ${INPUT_KEEP_ALIVE}s"
+        
+        # Add custom SSH flags
+        if [[ -n "$INPUT_EXTRA_FLAGS" ]]; then
+          SSH_CMD="$SSH_CMD $INPUT_EXTRA_FLAGS"
+          echo "🚩 Extra flags: $INPUT_EXTRA_FLAGS"
+        fi
+        
+        # Configure authentication method
+        if [[ -n "$INPUT_PASSWORD" ]]; then
+          SSH_CMD="sshpass -p '$INPUT_PASSWORD' $SSH_CMD"
+          echo "🔐 Authentication: Password"
+        elif [[ -n "$SSH_PRIVATE_KEY_PATH" ]]; then
+          SSH_CMD="$SSH_CMD -i '$SSH_PRIVATE_KEY_PATH'"
+          echo "🔐 Authentication: Private Key"
+        else
+          echo "🔐 Authentication: SSH Agent/Default"
+        fi
+        
+        # Add jump hosts if specified
+        if [[ -n "$INPUT_JUMP_HOSTS" ]]; then
+          echo "🦘 Jump hosts configured:"
+          JUMP_HOSTS=$(echo "$INPUT_JUMP_HOSTS" | tr ',' ' ')
+          for jump_host in $JUMP_HOSTS; do
+            SSH_CMD="$SSH_CMD -J $jump_host"
+            echo "   → $jump_host"
+          done
+        fi
+        
+        # Configure port forwarding
+        LOCAL_FORWARDS=""
+        REMOTE_FORWARDS=""
+        ALLOCATE_RANDOM=false
+        
+        # Process local port forwards
+        if [[ -n "$INPUT_LOCAL_FORWARDS" ]]; then
+          echo "🔗 Local port forwards:"
+          IFS=',' read -ra FORWARDS <<< "$INPUT_LOCAL_FORWARDS"
+          for forward in "${FORWARDS[@]}"; do
+            forward=$(echo "$forward" | xargs)
+            SSH_CMD="$SSH_CMD -L $forward"
+            LOCAL_FORWARDS="$LOCAL_FORWARDS$forward,"
+            echo "   📥 $forward"
+          done
+          LOCAL_FORWARDS="${LOCAL_FORWARDS%,}"
+        fi
+        
+        # Process remote port forwards
+        if [[ -n "$INPUT_REMOTE_FORWARDS" ]]; then
+          echo "🔗 Remote port forwards:"
+          IFS=',' read -ra FORWARDS <<< "$INPUT_REMOTE_FORWARDS"
+          for forward in "${FORWARDS[@]}"; do
+            forward=$(echo "$forward" | xargs)
+            SSH_CMD="$SSH_CMD -R $forward"
+            REMOTE_FORWARDS="$REMOTE_FORWARDS$forward,"
+            echo "   📤 $forward"
+            # Check for dynamic port allocation (port 0)
+            if [[ "$forward" =~ ^0: ]]; then
+              ALLOCATE_RANDOM=true
+              echo "      🎯 Dynamic port allocation requested"
+            fi
+          done
+          REMOTE_FORWARDS="${REMOTE_FORWARDS%,}"
+        fi
+        echo "allocate-random=$ALLOCATE_RANDOM" >> $GITHUB_OUTPUT
+        
+        # Add custom port if specified
+        if [[ -n "$INPUT_PORT" ]]; then
+          SSH_CMD="$SSH_CMD -p $INPUT_PORT"
+          echo "🔌 Custom SSH port: $INPUT_PORT"
+        fi
+        
+        # Build SSH target (user@host)
+        SSH_TARGET="$INPUT_HOST"
+        if [[ -n "$INPUT_USER" ]]; then
+          SSH_TARGET="$INPUT_USER@$SSH_TARGET"
+        fi
+        SSH_CMD="$SSH_CMD $SSH_TARGET"
+        echo "🎯 SSH target: $SSH_TARGET"
+        
+        # Store base command for post-processing
+        echo "base=$SSH_CMD" >> $GITHUB_OUTPUT
+
+        # Finalize command based on operation mode
+        if [[ -n "$INPUT_COMMAND" ]]; then
+          # Command execution mode
+          SSH_CMD="$SSH_CMD $(printf '%q' "$INPUT_COMMAND")"
+          echo "📋 Command to execute: $INPUT_COMMAND"
+        elif [[ $ALLOCATE_RANDOM == "false" ]]; then
+          # Background tunnel mode (no command execution)
+          SSH_CMD="$SSH_CMD -N -f"
+          echo "🔄 Background tunnel mode enabled"
+        fi
+
+        # Output the final command
+        echo "ssh=$SSH_CMD" >> $GITHUB_OUTPUT
+        echo ""
+        echo "🚀 Final SSH command prepared:"
+        echo "$SSH_CMD"
+
+    # ==========================================
+    # STEP 6: Execute SSH Command
+    # ==========================================
+    - name: 🚀 Execute SSH Connection
+      id: ssh
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        SSH_CMD: ${{ steps.cmd.outputs.ssh }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        ALLOCATE_RANDOM: ${{ steps.cmd.outputs.allocate-random }}
+      run: |
+        echo "🚀 Executing SSH connection..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        set -e
+        
+        if [[ -n "$INPUT_COMMAND" ]]; then
+          # Command execution mode
+          echo "📋 Executing remote command..."
+          eval "$SSH_CMD"
+          echo "✅ Command executed successfully!"
+          exit 0
+        
+        elif [[ "$ALLOCATE_RANDOM" == "true" ]]; then
+          # Dynamic port allocation mode
+          echo "🎯 Starting SSH with dynamic port allocation..."
+          SSH_OUTPUT=$(mktemp)
+          echo "📝 Capturing SSH output to: $SSH_OUTPUT"
+        
+          # Execute SSH and capture output
+          eval "$SSH_CMD" >"$SSH_OUTPUT" 2>&1 &
+          SSH_PID=$!
+          echo "🔄 SSH process started (PID: $SSH_PID)"
+        
+          # Wait for connection establishment
+          echo "⏳ Waiting for SSH connection establishment..."
+          sleep 10
+        
+          # Verify SSH process is still running
+          if ! kill -0 $SSH_PID 2>/dev/null; then
+            echo "❌ SSH process terminated unexpectedly!"
+            if [[ -f "$SSH_OUTPUT" ]]; then
+              echo "📋 SSH Error Output:"
+              cat "$SSH_OUTPUT"
+            fi
+            exit 1
+          fi
+        
+          # Parse allocated port information
+          ALLOCATED_PORT=""
+          ALLOCATED_HOST=""
+        
+          if [[ -f "$SSH_OUTPUT" && -s "$SSH_OUTPUT" ]]; then
+            echo "📋 SSH Output:"
+            cat "$SSH_OUTPUT"
+        
+            # Parse standard SSH allocated port message
+            ALLOCATED_PORT=$(grep -o "Allocated port [0-9]\+ for remote forward" "$SSH_OUTPUT" | grep -o "[0-9]\+" | head -1 || true)
+
+            # Parse tunnel service URLs (e.g., pinggy, serveo)
+            TUNNEL_URL=$(grep -o "tcp://[^[:space:]]*" "$SSH_OUTPUT" | head -1 || true)
+        
+            # Parse serveo.net format
+            if [[ -z "$TUNNEL_URL" ]]; then
+              TUNNEL_URL=$(grep -o "Forwarding TCP connections from [^[:space:]]*" "$SSH_OUTPUT" | head -1 || true)
+              if [[ -n "$TUNNEL_URL" ]]; then
+                TUNNEL_URL=$(echo "$TUNNEL_URL" | sed 's/.*from //')
+              fi
+            fi
+        
+            # Extract host and port from tunnel URL
+            if [[ -n "$TUNNEL_URL" ]]; then
+              HOST_PORT=$(echo "$TUNNEL_URL" | sed 's|^tcp://||')
+              ALLOCATED_HOST=$(echo "$HOST_PORT" | sed 's|:[0-9]*$||')
+              ALLOCATED_PORT=$(echo "$HOST_PORT" | grep -o ":[0-9]\+$" | grep -o "[0-9]\+" || true)
+            fi
+        
+            rm -f "$SSH_OUTPUT"
+          else
+            echo "❌ SSH output file is empty or missing"
+            exit 1
+          fi
+
+          # Output allocation results
+          if [[ -n "$ALLOCATED_PORT" ]]; then
+            echo "🎯 Allocated Port: $ALLOCATED_PORT"
+            echo "allocated-port=$ALLOCATED_PORT" >> $GITHUB_OUTPUT
+          fi
+        
+          if [[ -n "$ALLOCATED_HOST" ]]; then
+            echo "🌐 Allocated Host: $ALLOCATED_HOST"  
+            echo "allocated-host=$ALLOCATED_HOST" >> $GITHUB_OUTPUT
+          fi
+        
+        else
+          # Standard port forwarding mode
+          echo "🔗 Establishing port forwarding tunnel..."
+          eval "$SSH_CMD"
+        fi
+        
+        # Find and record SSH process PID
+        echo "🔍 Locating SSH tunnel process..."
+        sleep 2
+        
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          PID=$(pwsh -Command "
+            Get-WmiObject Win32_Process |
+              Where-Object { \$_.Name -eq 'ssh.exe' -and \$_.CommandLine -like '*${{ inputs.host }}*' } |
+              Select-Object -First 1 -ExpandProperty ProcessId
+          " || true)
+        else
+          PID=$(ps aux | grep "ssh.*${{ inputs.host }}" | grep -v grep | awk '{print $2}' | head -1 || true)
+        fi
+
+        if [[ -z "$PID" ]]; then
+          echo "❌ Could not locate SSH tunnel process"
+          exit 1
+        fi
+        
+        echo "✅ SSH tunnel established successfully!"
+        echo "🆔 Process ID: $PID"
+        
+        # Display connection summary
+        if [[ -n "${{ inputs.local-forwards }}" ]]; then
+          echo "📥 Local forwards active: ${{ inputs.local-forwards }}"
+        fi
+        if [[ -n "${{ inputs.remote-forwards }}" ]]; then
+          echo "📤 Remote forwards active: ${{ inputs.remote-forwards }}"
+        fi
+        
+        echo "pid=$PID" >> $GITHUB_OUTPUT
+
+    # ==========================================
+    # STEP 7: Cleanup Handler (Post-Run)
+    # ==========================================
+    - name: 🧹 Setup Cleanup Handler
+      uses: srz-zumix/post-run-action@v2
+      if: ${{ inputs.dry-run != 'true' }}
+      env:
+        SSH_CMD: ${{ steps.cmd.outputs.base }}
+        SSH_CONFIG_FILE: ${{ steps.ssh-config.outputs.ssh-config }}
+        SSH_TUNNEL_PID: ${{ steps.ssh.outputs.pid }}
+        INPUT_POST_CMD: ${{ inputs.post-command }}
+      with:
+        post-run: |
+          echo "🧹 Starting cleanup process..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          # Execute post-command if specified
+          if [[ -n "$INPUT_POST_CMD" ]]; then
+            echo "📋 Executing post-cleanup command..."
+            SSH_CMD="$SSH_CMD $(printf '%q' "$INPUT_POST_CMD")"
+            echo "Command: $SSH_CMD"
+            eval "$SSH_CMD"
+            echo "✅ Post-cleanup command completed"
+          fi
+
+          # Clean up temporary SSH configuration files
+          if [[ -n "$SSH_CONFIG_FILE" ]]; then
+            echo "🗑️ Removing temporary SSH config: $SSH_CONFIG_FILE"
+            rm "$SSH_CONFIG_FILE" || true
+          fi
+
+          # Terminate SSH tunnel process
+          if [[ -n "$SSH_TUNNEL_PID" ]]; then
+            echo "🔌 Terminating SSH tunnel (PID: $SSH_TUNNEL_PID)..."
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              taskkill /PID $SSH_TUNNEL_PID /F 2>/dev/null || true
+            else
+              # Graceful termination first, then force kill if needed
+              kill $SSH_TUNNEL_PID 2>/dev/null || (sleep 2 && kill -9 $SSH_TUNNEL_PID 2>/dev/null) || true
+            fi
+            echo "✅ SSH tunnel terminated successfully"
+          fi
+          
+          echo "✅ Cleanup process completed!"
