@@ -1,5 +1,5 @@
 name: 'SSH Command & Port Forwarding'
-description: '🛠️ SSH tunnels & remote commands. Port forwarding, deployments & execution via jump hosts. Linux/Windows/macOS'
+description: '🛠️ SSH Remote commands and Port forwarding with extensive configuration options. Supports Windows, macOS, Linux.'
 
 branding:
   icon: 'link'

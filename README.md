@@ -1,7 +1,7 @@
 # SSH Command & Port Forwarding Action 🔗
 
-A powerful GitHub Action for executing SSH commands and 
-establishing secure port forwarding tunnels with support for jump hosts, 
+A powerful GitHub Action for executing SSH commands and
+establishing secure port forwarding tunnels with support for jump hosts,
 dynamic port allocation, and comprehensive authentication methods.
 
 ## ✨ Features
@@ -62,14 +62,14 @@ dynamic port allocation, and comprehensive authentication methods.
 
 ```yaml
 name: Database Migration
-on: [push]
+on: [ push ]
 
 jobs:
   migrate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Database Tunnels
         uses: lexbritvin/ssh-action@v1
         with:
@@ -82,7 +82,7 @@ jobs:
             3306:mysql-replica.internal:3306
           timeout: 60
           keep-alive: 30
-      
+
       - name: Run Database Migration
         run: |
           # Now you can connect to localhost:5432, localhost:6379, localhost:3306
@@ -109,16 +109,16 @@ name: Production Deployment
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Deploy to Production
         uses: lexbritvin/ssh-action@v1
         with:
@@ -130,14 +130,14 @@ jobs:
           command: |
             set -e
             echo "🚀 Starting deployment..."
-            
+
             # Backup current version
             sudo cp -r /var/www/app /var/www/app.backup.$(date +%Y%m%d_%H%M%S)
-            
+
             # ...
-            
+
             echo "✅ Deployment completed successfully!"
-          
+
           post-command: |
             echo "🧹 Cleaning up old backups..."
             find /var/www -name "app.backup.*" -mtime +7 -delete
@@ -148,51 +148,52 @@ jobs:
 
 ### Connection Settings
 
-| Parameter | Description | Required | Default |
-|-----------|-------------|----------|---------|
-| `host` | Target SSH host | ✅ Yes    | - |
-| `port` | SSH port |          | `22` |
-| `username` | SSH username |          | Current user |
+| Parameter  | Description     | Required | Default      |
+|------------|-----------------|----------|--------------|
+| `host`     | Target SSH host | Yes      | -            |
+| `port`     | SSH port        | No       | `22`         |
+| `username` | SSH username    | No       | Current user |
 
 ### Authentication
 
-| Parameter | Description | Required | Default |
-|-----------|-------------|----------|---------|
-| `private-key` | SSH private key content |  | - |
-| `private-key-path` | Path to SSH private key file |  | - |
-| `password` | SSH password (not recommended) |  | - |
-| `known-hosts` | SSH known_hosts content |  | - |
+| Parameter          | Description                    | Required | Default |
+|--------------------|--------------------------------|----------|---------|
+| `private-key`      | SSH private key content        | No       | -       |
+| `private-key-path` | Path to SSH private key file   | No       | -       |
+| `password`         | SSH password (not recommended) | No       | -       |
+| `known-hosts`      | SSH known_hosts content        | No       | -       |
 
 ### Port Forwarding
 
-| Parameter | Description | Required | Default |
-|-----------|-------------|----------|---------|
-| `local-forwards` | Local port forwards (`-L`) |  | - |
-| `remote-forwards` | Remote port forwards (`-R`) |  | - |
+| Parameter         | Description                 | Required | Default |
+|-------------------|-----------------------------|----------|---------|
+| `local-forwards`  | Local port forwards (`-L`)  | No       | -       |
+| `remote-forwards` | Remote port forwards (`-R`) | No       | -       |
 
 ### Advanced Options
 
-| Parameter | Description | Required | Default |
-|-----------|-------------|----------|---------|
-| `jump-hosts` | Comma-separated jump hosts |  | - |
-| `extra-flags` | Additional SSH flags |  | - |
-| `command` | Command to execute |  | - |
-| `post-command` | Cleanup command |  | - |
-| `timeout` | Connection timeout (seconds) |  | `30` |
-| `keep-alive` | Keep-alive interval (seconds) |  | `60` |
-| `dry-run` | Show command without executing |  | `false` |
+| Parameter      | Description                    | Required | Default |
+|----------------|--------------------------------|----------|---------|
+| `jump-hosts`   | Comma-separated jump hosts     | No       | -       |
+| `extra-flags`  | Additional SSH flags           | No       | -       |
+| `command`      | Command to execute             | No       | -       |
+| `post-command` | Cleanup command                | No       | -       |
+| `timeout`      | Connection timeout (seconds)   | No       | `30`    |
+| `keep-alive`   | Keep-alive interval (seconds)  | No       | `60`    |
+| `dry-run`      | Show command without executing | No       | `false` |
 
 ## 📤 Outputs
 
-| Output | Description |
-|--------|-------------|
-| `pid` | Process ID of the SSH tunnel |
-| `allocated-host` | Public host for remote forward (dynamic allocation) |
+| Output           | Description                                            |
+|------------------|--------------------------------------------------------|
+| `pid`            | Process ID of the SSH tunnel                           |
+| `allocated-host` | Public host for remote forward (dynamic allocation)    |
 | `allocated-port` | Allocated port for remote forward (dynamic allocation) |
 
 ## 🔧 Port Forwarding Formats
 
 ### Local Forwards (`-L`)
+
 Forward local ports to remote destinations:
 
 ```yaml
@@ -202,6 +203,7 @@ local-forwards: "3000:localhost:3000,8080:nginx:80"    # Multiple forwards
 ```
 
 ### Remote Forwards (`-R`)
+
 Forward remote ports to local destinations:
 
 ```yaml
